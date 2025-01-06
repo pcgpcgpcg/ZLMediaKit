@@ -312,6 +312,118 @@ static inline void addHttpListener(){
     });
 }
 
+//add for server resource usage statistics
+// 获取CPU使用率
+static float getCpuUsage() {
+    static uint64_t lastTotalUser = 0, lastTotalUserLow = 0, lastTotalSys = 0, lastTotalIdle = 0;
+    
+    std::ifstream file("/proc/stat");
+    std::string line;
+    getline(file, line);
+    file.close();
+    
+    uint64_t totalUser, totalUserLow, totalSys, totalIdle;
+    sscanf(line.c_str(), "cpu %lu %lu %lu %lu", &totalUser, &totalUserLow, &totalSys, &totalIdle);
+
+    if (lastTotalUser == 0) {
+        lastTotalUser = totalUser;
+        lastTotalUserLow = totalUserLow;
+        lastTotalSys = totalSys;
+        lastTotalIdle = totalIdle;
+        return 0;
+    }
+
+    uint64_t total = (totalUser - lastTotalUser) + 
+                    (totalUserLow - lastTotalUserLow) + 
+                    (totalSys - lastTotalSys);
+    total += (totalIdle - lastTotalIdle);
+
+    float percent = total ? (float)(total - (totalIdle - lastTotalIdle)) / total * 100.0 : 0;
+
+    lastTotalUser = totalUser;
+    lastTotalUserLow = totalUserLow;
+    lastTotalSys = totalSys;
+    lastTotalIdle = totalIdle;
+
+    return percent;
+}
+
+// 获取内存使用情况
+static void getMemoryUsage(uint64_t& total, uint64_t& used) {
+    total = 0;
+    used = 0;
+    
+    std::ifstream file("/proc/meminfo");
+    if (!file.is_open()) return;
+    
+    std::string line;
+    uint64_t totalKB = 0, freeKB = 0, buffersKB = 0, cachedKB = 0;
+    
+    while (getline(file, line)) {
+        if (line.compare(0, 9, "MemTotal:") == 0)
+            sscanf(line.c_str(), "MemTotal: %lu kB", &totalKB);
+        else if (line.compare(0, 8, "MemFree:") == 0)
+            sscanf(line.c_str(), "MemFree: %lu kB", &freeKB);
+        else if (line.compare(0, 8, "Buffers:") == 0)
+            sscanf(line.c_str(), "Buffers: %lu kB", &buffersKB);
+        else if (line.compare(0, 7, "Cached:") == 0 && line.compare(0, 15, "Cached Swap:") != 0)
+            sscanf(line.c_str(), "Cached: %lu kB", &cachedKB);
+    }
+    
+    total = totalKB * 1024;  // 转换为字节
+    used = (totalKB - freeKB - buffersKB - cachedKB) * 1024;  // 实际使用的内存（不包括缓存和缓冲区）
+}
+
+// 获取网络带宽使用情况
+static void getNetworkUsage(uint64_t& rxBytes, uint64_t& txBytes) {
+    static uint64_t lastRxBytes = 0, lastTxBytes = 0;
+    static uint64_t lastTime = 0;
+    
+    std::ifstream file("/proc/net/dev");
+    std::string line;
+    rxBytes = 0;
+    txBytes = 0;
+    
+    // 跳过前两行
+    getline(file, line);
+    getline(file, line);
+    
+    // 累加所有网络接口的流量
+    while (getline(file, line)) {
+        size_t pos = line.find(':');
+        if (pos == std::string::npos) continue;
+        
+        uint64_t rx, tx;
+        sscanf(line.substr(pos + 1).c_str(), "%lu %*u %*u %*u %*u %*u %*u %*u %lu", &rx, &tx);
+        rxBytes += rx;
+        txBytes += tx;
+    }
+    file.close();
+
+    uint64_t currentTime = getCurrentMillisecond();
+    if (lastTime == 0) {
+        lastTime = currentTime;
+        lastRxBytes = rxBytes;
+        lastTxBytes = txBytes;
+        rxBytes = txBytes = 0;
+        return;
+    }
+
+    // 计算带宽（bytes/s）
+    uint64_t duration = currentTime - lastTime;
+    if (duration == 0) return;
+    
+    uint64_t tempRx = rxBytes;
+    uint64_t tempTx = txBytes;
+    
+    rxBytes = (rxBytes - lastRxBytes) * 1000 / duration;  // bytes per second
+    txBytes = (txBytes - lastTxBytes) * 1000 / duration;  // bytes per second
+    
+    lastTime = currentTime;
+    lastRxBytes = tempRx;
+    lastTxBytes = tempTx;
+}
+
 template <typename Type>
 class ServiceController {
 public:
@@ -795,6 +907,35 @@ void installWebApi() {
             invoker(200, headerOut, val.toStyledString());
         });
     });
+
+    // 注册系统负载获取接口
+    api_regist("/index/api/getSystemLoad", [](API_ARGS_MAP_ASYNC) {
+        CHECK_SECRET();
+
+        Value val;
+        val["code"] = API::Success;
+
+        // CPU使用率
+        val["data"]["cpu_usage"] = getCpuUsage();
+
+        // 内存使用情况
+        uint64_t totalMem, usedMem;
+        getMemoryUsage(totalMem, usedMem);
+        val["data"]["memory"]["total"] = totalMem;
+        val["data"]["memory"]["used"] = usedMem;
+        val["data"]["memory"]["usage"] = (float)usedMem / totalMem * 100.0;
+
+        // 网络带宽
+        uint64_t rxBytes, txBytes;
+        getNetworkUsage(rxBytes, txBytes);
+        val["data"]["network"]["rx_bytes_ps"] = rxBytes; // 每秒接收字节数
+        val["data"]["network"]["tx_bytes_ps"] = txBytes; // 每秒发送字节数
+        val["data"]["network"]["rx_mbps"] = rxBytes * 8.0 / 1024 / 1024; // 接收带宽（Mbps）
+        val["data"]["network"]["tx_mbps"] = txBytes * 8.0 / 1024 / 1024; // 发送带宽（Mbps）
+
+        invoker(200, headerOut, val.toStyledString());
+    });
+
 
     // 获取服务器配置  [AUTO-TRANSLATED:7dd2f3da]
     // Get server configuration
